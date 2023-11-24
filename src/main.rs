@@ -1,10 +1,16 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use anyhow::{anyhow, Result};
-use cargo_toml::{
-    Dependency, DependencyDetail, Inheritable, Manifest, Package, PackageTemplate, Workspace,
-};
+
 use tokio::{sync::RwLock, task::JoinHandle};
+use toml_edit::{Document, Formatted, Item, Value};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,71 +66,43 @@ impl Lookup {
             drop(seen_tasks);
             if let Ok(mut seen_tasks) = self.tasks.try_write() {
                 if seen_tasks.insert(target.clone()) {
-                    tasks.push(tokio::spawn(self.clone().run(target)));
+                    tasks.push(tokio::spawn(UnsafeSend(self.clone().run(target))));
                 }
                 return Ok(());
             }
         }
         let this = self.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(tokio::spawn(UnsafeSend(async move {
             let mut tasks = this.tasks.write().await;
             if tasks.insert(target.clone()) {
                 drop(tasks);
                 return this.run(target).await;
             }
             Ok(())
-        }));
+        })));
         Ok(())
     }
 
     async fn run(self: Arc<Self>, target: PathBuf) -> Result<()> {
-        let mut m: Manifest = toml::from_str(&tokio::fs::read_to_string(&target).await?)?;
+        let mut m: Document = tokio::fs::read_to_string(&target).await?.parse()?;
 
         let mut tasks = Vec::new();
 
-        for deps in [&mut m.dependencies, &mut m.build_dependencies]
-            .into_iter()
-            .chain(m.workspace.as_mut().map(|x| &mut x.dependencies))
-        {
-            for (_, dep) in deps {
-                if let Dependency::Detailed(DependencyDetail {
-                    version: version @ None,
-                    ..
-                }) = dep
-                {
-                    *version = Some(self.version.clone())
-                }
+        self.modify_dependency(m.get_mut("dependencies"), &mut tasks)
+            .await?;
+        self.modify_dependency(m.get_mut("dev-dependencies"), &mut tasks)
+            .await?;
+        self.modify_dependency(
+            m.get_mut("workspace")
+                .and_then(|x| x.get_mut("dependencies")),
+            &mut tasks,
+        )
+        .await?;
 
-                if let Dependency::Detailed(DependencyDetail {
-                    path: Some(path), ..
-                }) = dep
-                {
-                    self.add(path.as_str().into(), &mut tasks).await?;
-                }
-            }
-        }
+        self.modify_package(m.get_mut("package"));
+        self.modify_package(m.get_mut("workspace").and_then(|x| x.get_mut("package")));
 
-        if let Some(Package {
-            version: Inheritable::Set(version),
-            ..
-        }) = &mut m.package
-        {
-            *version = self.version.clone();
-        }
-
-        if let Some(Workspace {
-            package:
-                Some(PackageTemplate {
-                    version: Some(version),
-                    ..
-                }),
-            ..
-        }) = &mut m.workspace
-        {
-            *version = self.version.clone();
-        }
-
-        tokio::fs::write(target, toml::to_string(&m)?).await?;
+        tokio::fs::write(target, m.to_string()).await?;
 
         for task in tasks {
             task.await??;
@@ -132,4 +110,63 @@ impl Lookup {
 
         Ok(())
     }
+
+    async fn modify_dependency(
+        self: &Arc<Self>,
+        item: Option<&mut Item>,
+        tasks: &mut Vec<JoinHandle<Result<()>>>,
+    ) -> Result<()> {
+        let Some(item) = item else {
+            return Ok(());
+        };
+
+        let Some(item) = item.as_table_like_mut() else {
+            return Ok(());
+        };
+
+        for (_, item) in item.iter_mut() {
+            let Some(item) = item.as_table_like_mut() else {
+                continue;
+            };
+
+            if !item.contains_key("version") {
+                item.insert("version", self.version_item());
+            }
+
+            if let Some(path) = item.get("path") {
+                if let Some(path) = path.as_str() {
+                    self.add(path, tasks).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn modify_package(&self, item: Option<&mut Item>) {
+        let Some(item) = item else {
+            return;
+        };
+
+        if let Some(version) = item.get_mut("version") {
+            *version = self.version_item();
+        }
+    }
+
+    #[inline(always)]
+    fn version_item(&self) -> Item {
+        Item::Value(Value::String(Formatted::new(self.version.clone())))
+    }
 }
+
+struct UnsafeSend<T>(T);
+
+impl<T: Future> Future for UnsafeSend<T> {
+    type Output = T::Output;
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0) }.poll(cx)
+    }
+}
+
+unsafe impl<T> Send for UnsafeSend<T> {}

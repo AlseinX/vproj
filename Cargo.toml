@@ -1,6 +1,6 @@
 [package]
 name = "vproj"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Alsein Xiang <xyh951115@live.com>"]
 description = "Projects version in `Cargo.toml` files to make it ready to publish."
@@ -10,8 +10,7 @@ homepage = "https://github.com/AlseinX/vproj"
 license-file = "LICENSE"
 
 [dependencies]
-toml = "0.8.8"
-cargo_toml = "0.17.1"
+toml_edit = "0.21.0"
 anyhow = "1.0.75"
 tokio = { version = "1.34.0", features = [
     "macros",
