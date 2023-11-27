@@ -1,6 +1,6 @@
 [package]
 name = "vproj"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Alsein Xiang <xyh951115@live.com>"]
 description = "Projects version in `Cargo.toml` files to make it ready to publish."
