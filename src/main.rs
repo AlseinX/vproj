@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Result};
 
@@ -20,26 +23,27 @@ async fn main() -> Result<()> {
 
     let v = Arc::<str>::from(v);
     Recurse::new(move |target, tx| run(v.clone(), target, tx), calc_target)
-        .run(".".to_string())
+        .run(PathBuf::from("."))
         .await?;
 
     Ok(())
 }
 
-async fn calc_target(s: String) -> Result<PathBuf> {
+async fn calc_target(s: PathBuf) -> Result<PathBuf> {
     let mut path = tokio::fs::canonicalize(s).await?;
     path.push("Cargo.toml");
     Ok(path)
 }
 
-async fn run(version: Arc<str>, target: PathBuf, tx: UnboundedSender<String>) -> Result<()> {
+async fn run(version: Arc<str>, target: PathBuf, tx: UnboundedSender<PathBuf>) -> Result<()> {
     let mut m: Document = tokio::fs::read_to_string(&target).await?.parse()?;
-    modify_dependency(&version, m.get_mut("dependencies"), &tx);
-    modify_dependency(&version, m.get_mut("dev-dependencies"), &tx);
+    modify_dependency(&version, m.get_mut("dependencies"), &target, &tx);
+    modify_dependency(&version, m.get_mut("dev-dependencies"), &target, &tx);
     modify_dependency(
         &version,
         m.get_mut("workspace")
             .and_then(|x| x.get_mut("dependencies")),
+        &target,
         &tx,
     );
 
@@ -57,7 +61,12 @@ fn version_item(s: &str) -> Item {
     Item::Value(Value::String(Formatted::new(s.to_string())))
 }
 
-fn modify_dependency(version: &str, item: Option<&mut Item>, tx: &UnboundedSender<String>) {
+fn modify_dependency(
+    version: &str,
+    item: Option<&mut Item>,
+    current: &Path,
+    tx: &UnboundedSender<PathBuf>,
+) {
     let Some(item) = item else {
         return;
     };
@@ -77,7 +86,10 @@ fn modify_dependency(version: &str, item: Option<&mut Item>, tx: &UnboundedSende
 
         if let Some(path) = item.get("path") {
             if let Some(path) = path.as_str() {
-                tx.send(path.to_string()).unwrap();
+                let mut target = current.to_path_buf();
+                target.pop();
+                target.push(path);
+                tx.send(target).unwrap();
             }
         }
     }
